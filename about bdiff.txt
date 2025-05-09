@@ -1,0 +1,9 @@
+BetterDIFFerence - extension that used in diffilate
+Most common extension are .bdiff, but variants of it are not official (like .bdi, .bdf, .bif)
+The .bdiff have next header:
+{}
+
+.bdiff are proprietary file format that wasn't intended for usage in other places
+.bdiff compressed by RLE, and have diff info between two files
+.bdiff have maximum possible size per file of 18,446,744,073,709,551,615 bytes (which is 16 exabytes)
+.bdiff have own size that depends on header and input file sizes. When header switches mode, .bdiff may became larger
