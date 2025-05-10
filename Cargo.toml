@@ -1,9 +1,8 @@
 [package]
 name = "diffilate"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["arsenius_gen <arsenius.gen@proton.me>"]
 description = "Saves diffirence between files in optimized way"
 license = "MIT"
-
-[dependencies]
+repository = "https://github.com/ArsenijN/diffilate"  # Replace with your actual repository URL
