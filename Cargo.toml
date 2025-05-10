@@ -5,4 +5,4 @@ edition = "2021"
 authors = ["ArsenijN <arsenius.gen@proton.me>"]
 description = "Saves diffirence between files in optimized way"
 license = "MIT"
-repository = "https://github.com/ArsenijN/diffilate"  # Replace with your actual repository URL
+repository = "https://github.com/ArsenijN/diffilate"
