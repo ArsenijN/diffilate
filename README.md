@@ -1,5 +1,7 @@
 # diffilate
-Diff your files to save some space!
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
+Diff your files to save some space! 
 
 ## About diffiate
 
