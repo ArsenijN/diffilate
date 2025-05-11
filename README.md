@@ -25,6 +25,11 @@ I recently became the owner of corrupted data due to a bad flash drive. They don
 - [ ] Make .bdiff compression better
 - [ ] Check if .bdiff has a DIFF version inside to maintain compatibility with old .bdiff before switching to a new compression method
 - [ ] Make attempt about reducing of address size for smaller files by header or constant for file size
+
+### Known problems:
+- [ ] No backwards compatibility with V1 DIFF :<
+- [ ] Broken different size files
+- [ ] "The program was terminated due internal unregulated coincidence (file1.bin was bigger than file2.bin). Consider to NOT provide files with different sizes in reverse order of sorting." message was overkill, I know
 ---
 
 Diffilate like distillate :>
