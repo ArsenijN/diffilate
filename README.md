@@ -9,7 +9,7 @@ Diffilate saves differences between files in .bdiff file. When completed, you ca
 
 Diffilate effective when you have 2 copies of files that have same size (or different - see below) from failing media, and you need (for some reason) to keep both copies (maybe for later repair attempt)
 
-Diffilate can handle different file sizes, but only when the first file is larger than the second, otherwise... (see for yourself) (do not use that feature for now unless you sure that output 2nd file from 1st and diff is equal to original 2nd file)
+Diffilate can handle different file sizes, but only when the first file is larger than the second, otherwise... (see for yourself) **(do not use that feature for now unless you sure that output 2nd file from 1st and diff is equal to original 2nd file)**
 
 ## About .bdiff file extension
 
