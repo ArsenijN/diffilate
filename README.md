@@ -27,6 +27,7 @@ I recently became the owner of corrupted data due to a bad flash drive. They don
 - [ ] Make attempt about reducing of address size for smaller files by header or constant for file size
 
 ### Known problems:
+- [ ] Slowness on big amount of diffs, needs fixing
 - [ ] No backwards compatibility with V1 DIFF :<
 - [ ] Broken different size files (wrong output file from diff if input file sizes is not the same: len(file1.bin)≠len(file2.bin))
 - [ ] "The program was terminated due internal unregulated coincidence (file1.bin was bigger than file2.bin). Consider to NOT provide files with different sizes in reverse order of sorting." message was overkill, I know
