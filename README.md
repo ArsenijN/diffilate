@@ -1,36 +1,49 @@
 # diffilate
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-Diff your files to save some space! 
+Diff your files to save some space!
 
-## About diffiate
+## About diffilate
 
-Diffilate saves differences between files in .bdiff file. When completed, you can keep only 1st specified file and .bdiff to make 2nd file
+Diffilate saves the differences between two files into a `.bdiff` file. You can then keep only the 1st file and the `.bdiff` to reconstruct the 2nd file at any time.
 
-Diffilate effective when you have 2 copies of files that have same size (or different - see below) from failing media, and you need (for some reason) to keep both copies (maybe for later repair attempt)
+Diffilate is effective when you have two copies of a file damaged "in different ways" (e.g. from a failing flash drive with unstable reads), and want to keep both copies without storing them in full.
 
-Diffilate can handle different file sizes, but only when the first file is larger than the second, otherwise... (see for yourself) **(do not use that feature for now unless you sure that output 2nd file from 1st and diff is equal to original 2nd file)**
+Diffilate handles files of different sizes in both directions — file1 longer, file2 longer, or equal. All cases produce a correct reconstructed output.
 
-## About .bdiff file extension
+## Usage
 
-BetterDIFFerence, aka .bdiff - file extension that used for diffilate
-To view advanced info about files - consider to view `about bdiff.txt`
+```
+diffilate file1 file2              # Diff and write file1.bdiff
+diffilate --redo file1 diff.bdiff  # Reconstruct file2 from file1 + diff
+```
+
+## About .bdiff
+
+BetterDIFFerence — the `.bdiff` format used by diffilate.
+
+- Header: `DIFF` magic + version byte + max file size (u64 le) + flags byte
+- Diff records: absolute offset (u64 le) + run length (u8) + changed bytes from file2
+- RLE-grouped: consecutive differing bytes are batched into runs of up to 254 bytes
+- Maximum addressable file size: 18,446,744,073,709,551,615 bytes (16 EiB)
+- Format version is stored in the header for forward/backward compatibility
 
 ## Why?
 
-I recently became the owner of corrupted data due to a bad flash drive. They don't want to return the money (a case of "It works!" but its speed is now ~0.5 MB/s, and the store expects the status "not working at all"... Foxtrot has a "very" good user experience in terms of returns), and because of the double copy from this flash drive, the data was damaged "in different ways" (there was probably an unstable reading due to degradation of the memory chips), and because of my laziness to check where the correct data is (the flash drive was bit rotted), I decided to make a bdiff to leave copies of both files, while being able to save space
+I became the owner of corrupted data from a bad flash drive. The store wouldn't accept a return ("it works!" — yes, at 0.5 MB/s, thanks Foxtrot), and because I'd copied the data twice off the dying drive, both copies were damaged in different ways due to unstable reads from degrading memory chips. Rather than try to figure out which copy had which correct bytes, I wrote diffilate to store a compact diff between them — keeping both versions while only paying the storage cost of the differences.
 
 ---
-### Current improvements for the future:
-- [ ] Make .bdiff compression better
-- [ ] Check if .bdiff has a DIFF version inside to maintain compatibility with old .bdiff before switching to a new compression method
-- [ ] Make attempt about reducing of address size for smaller files by header or constant for file size
+
+### Improvements for the future:
+- [ ] Better `.bdiff` compression (beyond RLE grouping)
+- [ ] Reduce address field size for small files (4-byte offsets when file < 4 GiB, etc.)
+- [ ] Streaming diff mode (avoid loading all chunks into RAM before diffing)
+- [ ] Verify mode: check that file1 + diff produces a file matching a stored checksum
 
 ### Known problems:
-- [ ] Slowness on big amount of diffs, needs fixing
-- [ ] No backwards compatibility with V1 DIFF :<
-- [ ] Broken different size files (wrong output file from diff if input file sizes is not the same: len(file1.bin)≠len(file2.bin))
-- [ ] "The program was terminated due internal unregulated coincidence (file1.bin was bigger than file2.bin). Consider to NOT provide files with different sizes in reverse order of sorting." message was overkill, I know
+- [ ] No backward compatibility with V1 DIFF (headerless format)
+- [ ] Memory usage scales with file size during parallel diff (all chunks loaded at once)
+
 ---
 
 Diffilate like distillate :>

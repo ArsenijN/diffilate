@@ -1,12 +1,33 @@
 use std::env;
 use std::fs::File;
-use std::io::{Read, Write, BufReader, Seek, SeekFrom, Error, ErrorKind};
+use std::io::{Read, Write, BufReader, BufWriter, Seek, SeekFrom, Error, ErrorKind};
 use std::path::Path;
 use std::time::Instant;
+use rayon::prelude::*;
 
-const CHUNK_SIZE: usize = 1024 * 1024;
+// ── Format constants ──────────────────────────────────────────────────────────
+const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB per chunk
 const HEADER_MAGIC: &[u8; 4] = b"DIFF";
-const HEADER_VERSION: u8 = 6; // Increasing version number
+const HEADER_VERSION: u8 = 7;
+
+// V7 header layout (14 bytes total):
+//   [0..4]  magic   "DIFF"
+//   [4]     version 7
+//   [5..13] max_size  u64 le  (max of both file sizes)
+//   [13]    flags   u8
+//             bit 0: file1 was LONGER than file2 (truncation needed on redo)
+//             bit 1: RLE compression enabled (always 1 in V7)
+//
+// Diff record layout (V2-V7):
+//   [0..8]  abs_offset  u64 le
+//   [8]     run_len     u8   1..=254 = normal patch; 0xFF = size-extension
+//   [9..9+run_len] bytes from file2
+//
+// Size-extension record (only when sizes differ):
+//   offset  = min(size1, size2)
+//   len     = 0xFF
+//   if file2 > file1: raw appended bytes follow (read to EOF)
+//   if file1 > file2: 8-byte u64 le target_size follows, then EOF
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -16,351 +37,302 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    if args[1] == "--redo" {
-        if args.len() != 4 {
-            eprintln!("Error: --redo requires 2 arguments");
-            print_usage(&args[0]);
-            return Ok(());
+    match args[1].as_str() {
+        "--redo" => {
+            if args.len() != 4 {
+                eprintln!("Error: --redo requires exactly 2 arguments");
+                print_usage(&args[0]);
+                return Ok(());
+            }
+            redo(&args[2], &args[3])
         }
-        return redo(&args[2], &args[3]);
-    } else {
-        if args.len() != 3 {
-            eprintln!("Error: diff mode requires 2 arguments");
-            print_usage(&args[0]);
-            return Ok(());
+        _ => {
+            if args.len() != 3 {
+                eprintln!("Error: diff mode requires exactly 2 arguments");
+                print_usage(&args[0]);
+                return Ok(());
+            }
+            compare(&args[1], &args[2])
         }
-        return compare(&args[1], &args[2]);
     }
 }
 
 fn print_usage(program: &str) {
+    println!("diffilate v{}", env!("CARGO_PKG_VERSION"));
     println!("Usage:");
-    println!("  {} file1.bin file2.bin           # Compare and save file1.bin.bdiff", program);
-    println!("  {} --redo file1.bin diff.bdiff   # Apply diff.bdiff to file1 and save file1_diff.bin", program);
+    println!("  {program} file1 file2                 # Diff and write file1.bdiff");
+    println!("  {program} --redo file1 diff.bdiff     # Reconstruct file2 from file1 + diff");
 }
 
-fn get_output_filename(file_path: &str) -> String {
-    // Extract the full filename from the path
-    let path = Path::new(file_path);
-    let filename = path.file_name()
+fn bdiff_name(file_path: &str) -> String {
+    let filename = Path::new(file_path)
+        .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    
-    format!("{}.bdiff", filename)
+    format!("{filename}.bdiff")
 }
 
+// ── Per-chunk diff record ─────────────────────────────────────────────────────
+struct DiffRecord {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+fn encode_chunk(buf1: &[u8], buf2: &[u8], chunk_base: u64) -> Vec<DiffRecord> {
+    let len = buf1.len().min(buf2.len());
+    let mut records = Vec::new();
+    let mut i = 0usize;
+
+    while i < len {
+        if buf1[i] == buf2[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut run: Vec<u8> = Vec::with_capacity(254);
+        while i < len && buf1[i] != buf2[i] && run.len() < 254 {
+            run.push(buf2[i]);
+            i += 1;
+        }
+        records.push(DiffRecord {
+            offset: chunk_base + start as u64,
+            data: run,
+        });
+    }
+    records
+}
+
+// ── Compare (write diff) ──────────────────────────────────────────────────────
 fn compare(file1_path: &str, file2_path: &str) -> std::io::Result<()> {
-    let meta1 = std::fs::metadata(file1_path)?;
-    let meta2 = std::fs::metadata(file2_path)?;
-    let size1 = meta1.len();
-    let size2 = meta2.len();
+    let size1 = std::fs::metadata(file1_path)?.len();
+    let size2 = std::fs::metadata(file2_path)?.len();
     let max_size = size1.max(size2);
+    let min_size = size1.min(size2);
 
-    // Generate output filename based on the first input file
-    let output_filename = get_output_filename(file1_path);
-    let mut diff_out = File::create(&output_filename)?;
+    let out_path = bdiff_name(file1_path);
+    let mut out = BufWriter::new(File::create(&out_path)?);
 
-    // Write header
-    diff_out.write_all(HEADER_MAGIC)?; // 4 bytes
-    diff_out.write_all(&[HEADER_VERSION])?; // 1 byte
-    diff_out.write_all(&(max_size.to_le_bytes()))?; // 8 bytes
+    // Header (14 bytes)
+    out.write_all(HEADER_MAGIC)?;
+    out.write_all(&[HEADER_VERSION])?;
+    out.write_all(&max_size.to_le_bytes())?;
+    let flags: u8 = 0b10 | if size1 > size2 { 0b01 } else { 0b00 };
+    out.write_all(&[flags])?;
 
-    // Now handle both cases: file1 ≤ file2 and file1 > file2
-    // In V6, we'll always store differences relative to the first file
-    // without swapping the order of files based on size
-    diff_out.write_all(&[if size1 <= size2 { 0x00 } else { 0x01 }])?; // Flag for which file is larger
-    
-    let result = process_files(
-        file1_path,
-        file2_path,
-        size1,
-        size2,
-        &mut diff_out,
-        false // We don't use the reversed flag anymore in V6
-    )?;
-
-    println!("\n✅ Done! Saved difference blocks to {}", output_filename);
-    Ok(())
-}
-
-fn process_files(
-    file1_path: &str,
-    file2_path: &str,
-    file1_size: u64,
-    file2_size: u64,
-    diff_out: &mut File,
-    _reversed: bool, // Keep for backward compatibility but not used in V6
-) -> std::io::Result<(u64, u64)> {
-    let mut file1 = BufReader::new(File::open(file1_path)?);
-    let mut file2 = BufReader::new(File::open(file2_path)?);
-    
-    let mut buf1 = vec![0u8; CHUNK_SIZE];
-    let mut buf2 = vec![0u8; CHUNK_SIZE];
-
-    let mut offset: u64 = 0;
-    let mut diff_blocks = 0u64;
-    let start_time = Instant::now();
-    
-    // Find the minimum size to compare byte-by-byte
-    let min_size = std::cmp::min(file1_size, file2_size);
-
-    // Process the common part of both files
-    while offset < min_size {
-        let read_len = std::cmp::min(CHUNK_SIZE as u64, min_size - offset) as usize;
-        file1.read_exact(&mut buf1[..read_len])?;
-        file2.read_exact(&mut buf2[..read_len])?;
-
-        let mut i = 0;
-        while i < read_len {
-            let mut bytes_equal = buf1[i] == buf2[i];
-
-            if !bytes_equal {
-                let start = i;
-                let mut run_len = 0;
-                
-                // Find sequence of different bytes (limited to 255 bytes)
-                while i < read_len && !bytes_equal && run_len < 255 {
-                    run_len += 1;
-                    i += 1;
-                    
-                    if i < read_len {
-                        bytes_equal = buf1[i] == buf2[i];
-                    }
-                }
-
-                let abs_offset = offset + start as u64;
-                diff_out.write_all(&abs_offset.to_le_bytes())?;
-                diff_out.write_all(&[run_len as u8])?;
-                
-                // Always write bytes from file2 (target)
-                diff_out.write_all(&buf2[start..start + run_len])?;
-                
-                diff_blocks += 1;
-            } else {
-                i += 1;
-            }
-        }
-
-        offset += read_len as u64;
-
-        if offset % (100 * 1024 * 1024) < CHUNK_SIZE as u64 || offset == min_size {
-            let percent = (offset as f64 / min_size as f64) * 100.0;
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 { offset as f64 / elapsed } else { 0.0 };
-            let remaining = min_size - offset;
-            let eta = if speed > 0.0 { remaining as f64 / speed } else { 0.0 };
-            println!(
-                "Progress: {:>6.2}% | Offset: {:>10} / {:>10} | Diffs: {:>6} | ETA: {:>6.1}s",
-                percent, offset, min_size, diff_blocks, eta
-            );
+    // Read phase: slurp all chunks sequentially (I/O bound, must be in order)
+    let total_chunks = ((min_size as usize) + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let mut chunks: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(total_chunks);
+    {
+        let mut f1 = BufReader::new(File::open(file1_path)?);
+        let mut f2 = BufReader::new(File::open(file2_path)?);
+        let mut remaining = min_size;
+        while remaining > 0 {
+            let n = (CHUNK_SIZE as u64).min(remaining) as usize;
+            let mut b1 = vec![0u8; n];
+            let mut b2 = vec![0u8; n];
+            f1.read_exact(&mut b1)?;
+            f2.read_exact(&mut b2)?;
+            chunks.push((b1, b2));
+            remaining -= n as u64;
         }
     }
-    
-    // Handle the case where one file is longer than the other
-    if file1_size != file2_size {
-        // Store the marker and size difference
-        diff_out.write_all(&(min_size.to_le_bytes()))?; // offset where extension starts
-        diff_out.write_all(&[0xFF])?; // Special marker
-        
-        if file2_size > file1_size {
-            // File2 is longer, store the remainder
-            let remainder_size = file2_size - file1_size;
-            let mut extra = vec![0u8; std::cmp::min(remainder_size, 10_000_000) as usize];
-            
-            let mut remaining = remainder_size;
-            while remaining > 0 {
-                let read_size = std::cmp::min(extra.len() as u64, remaining) as usize;
-                file2.read_exact(&mut extra[..read_size])?;
-                diff_out.write_all(&extra[..read_size])?;
-                remaining -= read_size as u64;
-            }
+
+    let start = Instant::now();
+
+    // Diff phase: parallel over chunks
+    let chunk_results: Vec<Vec<DiffRecord>> = chunks
+        .par_iter()
+        .enumerate()
+        .map(|(idx, (b1, b2))| encode_chunk(b1, b2, idx as u64 * CHUNK_SIZE as u64))
+        .collect();
+
+    // Write phase: in-order
+    let mut total_records: u64 = 0;
+    let mut total_diff_bytes: u64 = 0;
+    for records in &chunk_results {
+        for rec in records {
+            out.write_all(&rec.offset.to_le_bytes())?;
+            out.write_all(&[rec.data.len() as u8])?;
+            out.write_all(&rec.data)?;
+            total_records += 1;
+            total_diff_bytes += rec.data.len() as u64;
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let speed = (min_size as f64 / 1024.0 / 1024.0) / elapsed.max(0.001);
+    println!(
+        "Diffed {} MiB in {:.2}s  ({:.1} MiB/s) | {} records  ({} diff bytes  /  {} ratio)",
+        min_size / 1024 / 1024,
+        elapsed,
+        speed,
+        total_records,
+        total_diff_bytes,
+        if min_size > 0 {
+            format!("{:.4}", total_diff_bytes as f64 / min_size as f64)
         } else {
-            // File1 is longer, we need to mark this to handle the redo operation correctly
-            // Write a special size marker to indicate file1 is longer and should be truncated
-            diff_out.write_all(&file2_size.to_le_bytes())?;
+            "N/A".into()
         }
-    }
-    
-    Ok((file1_size, file2_size))
+    );
 
-    Ok((smaller_size, larger_size))
-}
+    // Size-extension record
+    if size1 != size2 {
+        out.write_all(&min_size.to_le_bytes())?;
+        out.write_all(&[0xFF_u8])?;
 
-fn redo(file1_path: &str, diff_path: &str) -> std::io::Result<()> {
-    let mut file1 = File::open(file1_path)?;
-    let mut data = Vec::new();
-    file1.read_to_end(&mut data)?;
-
-    // Generate output filename based on the first input file
-    let path = Path::new(file1_path);
-    let filename = path.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-    let output_filename = format!("{}_diff.bin", filename);
-
-    // Try multiple version formats, starting with the newest
-    let mut versions_to_try = vec![6, 5, 4, 3, 2, 1];
-    let mut success = false;
-    
-    while !versions_to_try.is_empty() && !success {
-        let version = versions_to_try.remove(0);
-        match apply_diff(&mut data, diff_path, version, file1_path, &output_filename) {
-            Ok(applied) => {
-                println!("✅ Patching complete with format version {}. Saved to {} ({} blocks applied)", 
-                         version, output_filename, applied);
-                success = true;
-            },
-            Err(e) => {
-                if versions_to_try.is_empty() {
-                    return Err(e);
-                }
-                println!("Info: Trying older format version (v{})...", versions_to_try[0]);
+        if size2 > size1 {
+            // Append extra tail of file2
+            let mut f2 = BufReader::new(File::open(file2_path)?);
+            f2.seek(SeekFrom::Start(min_size))?;
+            let mut buf = vec![0u8; 65536];
+            let mut remaining = size2 - size1;
+            while remaining > 0 {
+                let n = (buf.len() as u64).min(remaining) as usize;
+                f2.read_exact(&mut buf[..n])?;
+                out.write_all(&buf[..n])?;
+                remaining -= n as u64;
             }
+            println!("  file2 is longer: +{} appended bytes stored", size2 - size1);
+        } else {
+            // Truncation: store target size only
+            out.write_all(&size2.to_le_bytes())?;
+            println!("  file1 is longer: truncation to {} bytes recorded", size2);
         }
     }
 
-    if !success {
-        return Err(Error::new(ErrorKind::InvalidData, "Could not apply diff file with any known format"));
-    }
-    
+    out.flush()?;
+    println!("✅  Done!  Diff saved to {out_path}");
     Ok(())
 }
 
-fn apply_diff(data: &mut Vec<u8>, diff_path: &str, version: u8, file1_path: &str, output_filename: &str) -> std::io::Result<u64> {
-    let mut diff = File::open(diff_path)?;
-    let mut applied = 0u64;
-    let mut is_reversed = false;
-    
-    match version {
-        1 => {
-            // V1: No header, just start reading diffs
-            // Nothing to do here, start processing immediately
-        },
-        2..=6 => {
-            // V2-V5: Header with magic and version
-            let mut header = [0u8; 13];
-            diff.read_exact(&mut header)?;
-            
-            if &header[0..4] != HEADER_MAGIC {
-                return Err(Error::new(ErrorKind::InvalidData, "Invalid diff file (bad magic)"));
-            }
-            
-            let _version = header[4];
-            let _max_size = u64::from_le_bytes(header[5..13].try_into().unwrap());
-            
-            // In V5, check for the reversed flag
-            // Handle version specific flags
-            if version == 5 {
-                // V5: Check for the reversed flag (0xFE)
-                let mut flag_buf = [0u8; 1];
-                match diff.read_exact(&mut flag_buf) {
-                    Ok(_) => {
-                        if flag_buf[0] == 0xFE {
-                            // Files were processed in reverse order
-                            is_reversed = true;
-                        } else {
-                            // Not a reversed flag, seek back
-                            diff.seek(SeekFrom::Current(-1))?;
-                        }
-                    },
-                    Err(_) => {
-                        // Couldn't read flag, ignore and continue with normal processing
-                        diff.seek(SeekFrom::Current(-1))?;
-                    }
-                }
-            } else if version == 6 {
-                // V6: Read a flag that tells us which file was larger
-                let mut flag_buf = [0u8; 1];
-                diff.read_exact(&mut flag_buf)?;
-                
-                // 0x01 means first file was larger than second
-                // For applying a diff, we don't need to change behavior
-                // Just read this flag and continue
-            }
-            }
-        },
-        _ => return Err(Error::new(ErrorKind::InvalidData, "Unsupported diff version"))
-    }
-    
-    // Process the diff file
-    loop {
-        let mut offset_buf = [0u8; 8];
-        if let Err(e) = diff.read_exact(&mut offset_buf) {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                // Reached end of file normally
-                break;
-            } else {
-                // Other error
-                return Err(e);
-            }
-        }
-        let offset = u64::from_le_bytes(offset_buf);
+// ── Redo (apply diff) ─────────────────────────────────────────────────────────
+fn redo(file1_path: &str, diff_path: &str) -> std::io::Result<()> {
+    let mut data: Vec<u8> = {
+        let mut f = File::open(file1_path)?;
+        let mut v = Vec::new();
+        f.read_to_end(&mut v)?;
+        v
+    };
 
-        let mut len_buf = [0u8; 1];
-        if diff.read_exact(&mut len_buf).is_err() {
-            // This shouldn't happen - if we read the offset, we should be able to read the length
-            return Err(Error::new(ErrorKind::InvalidData, "Truncated diff file"));
+    let out_path = {
+        let name = Path::new(file1_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        format!("{name}_redo.bin")
+    };
+
+    let applied = apply_diff(&mut data, diff_path)?;
+
+    let mut out = File::create(&out_path)?;
+    out.write_all(&data)?;
+    println!("✅  Redo complete → {out_path}  ({applied} patch records applied)");
+    Ok(())
+}
+
+fn apply_diff(data: &mut Vec<u8>, diff_path: &str) -> std::io::Result<u64> {
+    let mut diff = BufReader::new(File::open(diff_path)?);
+
+    // Detect version from header
+    let mut magic = [0u8; 4];
+    diff.read_exact(&mut magic)?;
+
+    let version: u8;
+    let is_truncation: bool;
+
+    if &magic == HEADER_MAGIC {
+        let mut vbuf = [0u8; 1];
+        diff.read_exact(&mut vbuf)?;
+        version = vbuf[0];
+
+        let mut sbuf = [0u8; 8];
+        diff.read_exact(&mut sbuf)?;
+        // _max_size consumed
+
+        is_truncation = match version {
+            2..=4 => false,
+            5 => {
+                // V5: peek for optional 0xFE flag
+                let mut fb = [0u8; 1];
+                match diff.read_exact(&mut fb) {
+                    Ok(_) if fb[0] == 0xFE => false, // reversed flag, treat as normal
+                    Ok(_) => { diff.seek(SeekFrom::Current(-1))?; false }
+                    Err(_) => false,
+                }
+            }
+            6 => {
+                let mut fb = [0u8; 1];
+                diff.read_exact(&mut fb)?;
+                fb[0] == 0x01
+            }
+            7 => {
+                let mut fb = [0u8; 1];
+                diff.read_exact(&mut fb)?;
+                (fb[0] & 0x01) != 0
+            }
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Unsupported DIFF version {other}"),
+                ));
+            }
+        };
+        println!("Format: DIFF V{version}  (truncation_needed={is_truncation})");
+    } else {
+        // V1: no header — seek back to start, treat first 4 bytes as offset data
+        diff.seek(SeekFrom::Start(0))?;
+        version = 1;
+        is_truncation = false;
+        println!("Format: DIFF V1 (headerless)");
+    }
+
+    let mut applied: u64 = 0;
+
+    loop {
+        let mut obuf = [0u8; 8];
+        match diff.read_exact(&mut obuf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
         }
-        let len = len_buf[0];
+        let offset = u64::from_le_bytes(obuf);
+
+        let mut lbuf = [0u8; 1];
+        diff.read_exact(&mut lbuf)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Truncated diff: missing length byte"))?;
+        let len = lbuf[0];
 
         if len == 0xFF {
-            // Special trailing data marker
-            if version == 6 {
-                // In V6, we have two cases: appending or truncating
-                let mut target_size_buf = [0u8; 8];
-                
-                // First try to read the target size (exists only when truncating)
-                if let Ok(_) = diff.read_exact(&mut target_size_buf) {
-                    // If we can read 8 more bytes, it's a truncation command (file1 > file2)
-                    let target_size = u64::from_le_bytes(target_size_buf);
-                    
-                    // Truncate the data to the target size
-                    if data.len() > target_size as usize {
-                        data.truncate(target_size as usize);
-                    }
-                } else {
-                    // No target size, just read the remaining data and append it
-                    let mut trailing = Vec::new();
-                    diff.read_to_end(&mut trailing)?;
-                    data.extend(trailing);
+            if is_truncation {
+                // Read 8-byte target size
+                let mut ts = [0u8; 8];
+                diff.read_exact(&mut ts)?;
+                let target = u64::from_le_bytes(ts) as usize;
+                if data.len() > target {
+                    data.truncate(target);
+                    println!("  Truncated to {target} bytes");
                 }
             } else {
-                // Pre-V6 behavior
-                let mut trailing = Vec::new();
-                diff.read_to_end(&mut trailing)?;
-                data.extend(trailing);
+                // Append tail
+                let mut tail = Vec::new();
+                diff.read_to_end(&mut tail)?;
+                println!("  Appended {} bytes", tail.len());
+                data.extend(tail);
             }
             break;
         }
 
         let mut patch = vec![0u8; len as usize];
-        if diff.read_exact(&mut patch).is_err() {
-            return Err(Error::new(ErrorKind::InvalidData, "Truncated diff file"));
-        }
+        diff.read_exact(&mut patch)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "Truncated diff: missing patch bytes"))?;
 
-        if is_reversed && version < 6 {
-            // Only relevant for V5 and earlier
-            // In reversed mode, we're actually replacing bytes in file2 with bytes from file1
-            // But since we're applying the diff to file1, we need to keep the bytes from file1
-            // So we don't apply the patch in this case
-        } else {
-            // Normal mode - apply the patch
-            // Ensure the data vector is large enough
-            if (offset as usize + len as usize) > data.len() {
-                data.resize(offset as usize + len as usize, 0);
-            }
-            
-            // Apply the patch
-            for i in 0..len as usize {
-                data[offset as usize + i] = patch[i];
-            }
+        let end = offset as usize + len as usize;
+        if end > data.len() {
+            data.resize(end, 0);
         }
-
+        data[offset as usize..end].copy_from_slice(&patch);
         applied += 1;
     }
 
-    let mut out = File::create(output_filename)?;
-    out.write_all(&data)?;
-    
     Ok(applied)
 }
