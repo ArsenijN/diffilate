@@ -1,8 +1,8 @@
 [package]
 name = "diffilate"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 authors = ["ArsenijN <arsenius.gen@proton.me>"]
-description = "Saves diffirence between files in optimized way"
+description = "Saves differences between files in an optimized format"
 license = "MIT"
 repository = "https://github.com/ArsenijN/diffilate"
