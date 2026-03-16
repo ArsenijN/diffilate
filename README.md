@@ -42,7 +42,6 @@ I became the owner of corrupted data from a bad flash drive. The store wouldn't 
 
 ### Known problems:
 - [ ] No backward compatibility with V1 DIFF (headerless format)
-- [ ] Memory usage scales with file size during parallel diff (all chunks loaded at once)
 
 ---
 
