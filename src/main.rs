@@ -278,7 +278,7 @@ fn apply_diff_streaming(diff_path: &str, out_path: &str) -> std::io::Result<u64>
         diff.read_exact(&mut sbuf)?; // consume max_size
 
         is_truncation = match version {
-            2..=4 => false,
+            1..=4 => false,   // ← was 2..=4
             5 => {
                 let mut fb = [0u8; 1];
                 match diff.read_exact(&mut fb) {
